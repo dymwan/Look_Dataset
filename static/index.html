@@ -30,8 +30,7 @@
         <input type="text" id="path-input" placeholder="/Volumes/data/...">
         <button id="btn-browse">浏览</button>
       </div>
-      <div class="breadcrumb" id="breadcrumb"></div>
-      <div class="file-list" id="file-list">
+      <div class="path-status" id="path-status">
         <p class="hint">输入路径后点击"浏览"</p>
       </div>
     </section>
@@ -48,7 +47,6 @@
             <option value="xywh">xywh (左上+宽高)</option>
           </select>
         </div>
-        <button id="btn-load-selected" style="display:none;">加载选中文件</button>
       </div>
     </section>
 
@@ -129,9 +127,9 @@
   var E = {};
   function cacheEls() {
     var ids = [
-      "path-input","btn-browse","breadcrumb","file-list",
+      "path-input","btn-browse","path-status",
       "keymap-panel","keymap-loading","keymap-content","keymap-grid",
-      "bbox-mode-row","bbox-mode","detect-status","btn-load-selected",
+      "bbox-mode-row","bbox-mode","detect-status",
       "btn-random","sample-count","sample-status",
       "show-bbox","show-polygon","show-keypoint","show-label",
       "canvas-container","image-wrapper","main-image","overlay-canvas",
@@ -166,7 +164,6 @@
     var isPT = state.datasetType === "pt";
     E["keymap-panel"].style.display = isPT ? "" : "none";
     if (E["bbox-mode-row"]) E["bbox-mode-row"].style.display = "none";
-    if (E["btn-load-selected"]) E["btn-load-selected"].style.display = "none";
     state.keys = [];
     state.samples = [];
     resetView();
@@ -181,76 +178,28 @@
     });
   });
 
-  // ---- Path browsing ----
-  E["btn-browse"].addEventListener("click", function() { browsePath(E["path-input"].value.trim()); });
-  E["path-input"].addEventListener("keydown", function(e) { if (e.key === "Enter") browsePath(E["path-input"].value.trim()); });
+  // ---- Path validation ----
+  E["btn-browse"].addEventListener("click", function() { checkPath(E["path-input"].value.trim()); });
+  E["path-input"].addEventListener("keydown", function(e) { if (e.key === "Enter") checkPath(E["path-input"].value.trim()); });
 
-  function browsePath(path) {
+  function checkPath(path) {
     if (!path) return;
     state.currentPath = path;
     E["path-input"].value = path;
-    E["file-list"].innerHTML = '<span class="spinner"></span> 加载中...';
-    apiGet("/api/browse?path=" + encodeURIComponent(path)).then(function(data) {
-      renderBreadcrumb(data);
-      renderFileList(data);
-      if (state.datasetType === "pt" && data.pt_files.length > 0) {
-        autoDetectFirst(data.pt_files[0]);
-      } else if (state.datasetType === "coco" && data.json_files.length > 0) {
-        E["sample-status"].textContent = "发现 " + data.json_files.length + " 个 JSON 文件";
+    E["path-status"].innerHTML = '<span class="spinner"></span> 检测中...';
+    apiGet("/api/check-path?path=" + encodeURIComponent(path)).then(function(data) {
+      if (data.exists) {
+        E["path-status"].innerHTML = '<span style="color:#3cb44b;font-size:1.1rem;">&#10004;</span> <span style="color:#3cb44b;">路径有效</span>';
+        E["sample-status"].textContent = "";
+      } else {
+        E["path-status"].innerHTML = '<span style="color:#e94560;font-size:1.1rem;">&#10008;</span> <span style="color:#e94560;">' + (data.error || "路径不存在") + '</span>';
       }
     }).catch(function(e) {
-      E["file-list"].innerHTML = '<p class="hint" style="color:#e94560;">错误: ' + e.message + '</p>';
+      E["path-status"].innerHTML = '<span style="color:#e94560;font-size:1.1rem;">&#10008;</span> <span style="color:#e94560;">错误: ' + e.message + '</span>';
     });
   }
 
-  function renderBreadcrumb(data) {
-    var parts = data.path.split("/").filter(Boolean);
-    var html = '<span data-path="/">/</span>';
-    var cum = "";
-    parts.forEach(function(p) {
-      cum += "/" + p;
-      html += '<span data-path="' + cum + '">' + p + '</span> / ';
-    });
-    E["breadcrumb"].innerHTML = html;
-    qsa("#breadcrumb span").forEach(function(el) {
-      el.addEventListener("click", function() { browsePath(el.dataset.path); });
-    });
-  }
-
-  function renderFileList(data) {
-    if (data.error) {
-      E["file-list"].innerHTML = '<p class="hint" style="color:#e94560;">' + data.error + '</p>';
-      return;
-    }
-    var html = "";
-    if (data.parent !== data.path) {
-      html += '<div class="item" data-path="' + data.parent + '"><span class="icon">📁</span> ../</div>';
-    }
-    data.dirs.forEach(function(d) {
-      html += '<div class="item dir" data-path="' + d.path + '"><span class="icon">📁</span> ' + d.name + '</div>';
-    });
-    var show = state.datasetType === "pt" ? data.pt_files : data.files;
-    var icon = state.datasetType === "pt" ? "📄" : "🖼";
-    show.forEach(function(f) {
-      html += '<div class="item file" data-path="' + f.path + '"><span class="icon">' + icon + '</span> ' + f.name + '</div>';
-    });
-    E["file-list"].innerHTML = html || '<p class="hint">空目录</p>';
-
-    qsa("#file-list .item.dir").forEach(function(el) {
-      el.addEventListener("click", function() { browsePath(el.dataset.path); });
-    });
-    qsa("#file-list .item.file").forEach(function(el) {
-      el.addEventListener("click", function() {
-        qsa("#file-list .item").forEach(function(i) { i.classList.remove("selected"); });
-        el.classList.add("selected");
-        if (state.datasetType === "pt") detectKeys(el.dataset.path);
-      });
-    });
-  }
-
-  // ---- PT Key detection ----
-  function autoDetectFirst(ptFile) { detectKeys(ptFile.path); }
-
+  // ---- PT Key detection (unused, kept for reference) ----
   function detectKeys(filePath) {
     var dir = filePath.substring(0, filePath.lastIndexOf("/"));
     var file = filePath.substring(filePath.lastIndexOf("/") + 1);
@@ -322,7 +271,6 @@
     });
     E["keymap-grid"].innerHTML = html;
     E["bbox-mode-row"].style.display = (am.bbox || am.label) ? "flex" : "none";
-    E["btn-load-selected"].style.display = "";
     qsa("#keymap-grid select").forEach(function(sel) {
       sel.addEventListener("change", function() {
         var kn = sel.dataset.key;
@@ -336,14 +284,6 @@
   }
 
   // ---- Random Sample ----
-  E["btn-load-selected"].addEventListener("click", function() {
-    var sel = qsa("#file-list .item.file.selected");
-    if (sel.length === 0) return;
-    var files = [];
-    sel.forEach(function(el) { files.push(el.dataset.path.split("/").pop()); });
-    loadSamples(files);
-  });
-
   E["btn-random"].addEventListener("click", function() { randomSample(); });
 
   function randomSample() {
@@ -356,6 +296,7 @@
 
     if (state.datasetType === "pt") {
       apiGet("/api/browse?path=" + encodeURIComponent(path)).then(function(data) {
+        if (data.error) { E["sample-status"].textContent = data.error; resetBtn(); return; }
         var files = data.pt_files.map(function(f) { return f.name; });
         if (files.length === 0) { E["sample-status"].textContent = "没有找到 .pt 文件"; resetBtn(); return; }
         var count = Math.min(parseInt(E["sample-count"].value) || 10, files.length);

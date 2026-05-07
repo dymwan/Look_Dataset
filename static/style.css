@@ -119,37 +119,14 @@ header h1 {
   font-family: monospace;
 }
 
-/* Breadcrumb */
-.breadcrumb {
-  font-size: 0.75rem;
-  color: var(--accent2);
-  margin-top: 4px;
-  word-break: break-all;
-  cursor: default;
-}
-.breadcrumb span {
-  cursor: pointer;
-}
-.breadcrumb span:hover { text-decoration: underline; }
-
-/* File list */
-.file-list {
-  max-height: 200px;
-  overflow-y: auto;
+/* Path status indicator */
+.path-status {
   margin-top: 6px;
-  font-size: 0.78rem;
-}
-.file-list .item {
-  padding: 4px 6px;
-  cursor: pointer;
-  border-radius: 3px;
+  font-size: 0.82rem;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
 }
-.file-list .item:hover { background: var(--hover); }
-.file-list .item.selected { background: var(--accent2); color: #fff; }
-.file-list .item .icon { font-size: 0.9rem; flex-shrink: 0; }
 
 /* Keymap */
 .keymap-grid { display: flex; flex-direction: column; gap: 4px; }

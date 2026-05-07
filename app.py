@@ -404,6 +404,26 @@ def _color_for_id(cat_id: int) -> str:
 # API Routes
 # ============================================================================
 
+@app.get("/api/check-path")
+async def check_path(path: str = Query("/")):
+    """Quick check if a path exists. No directory listing — fast even over Samba."""
+    p = Path(path)
+    if not p.exists():
+        return JSONResponse({
+            "exists": False,
+            "path": path,
+            "error": f"Path does not exist: {path}",
+            "is_dir": False,
+        })
+    is_dir = p.is_dir()
+    return JSONResponse({
+        "exists": True,
+        "path": str(p),
+        "error": None,
+        "is_dir": is_dir,
+    })
+
+
 @app.get("/api/browse")
 async def browse(path: str = Query("/")):
     """Browse a directory, returning subdirs and files."""
@@ -769,7 +789,7 @@ async def serve_file(path: str = Query(...)):
 
 @app.get("/")
 async def index():
-    return FileResponse("static/index.html")
+    return FileResponse("static/index.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
