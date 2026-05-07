@@ -2,6 +2,8 @@
 
 A local web-based visualization tool for inspecting training datasets. Browse, filter, and visually verify PyTorch `.pt` files and COCO JSON datasets through an interactive HTML5 Canvas frontend — no uploads, data never leaves your machine.
 
+![demo screenshot](fig/demo.png)
+
 ## Features
 
 - **PyTorch `.pt` support** — auto-detect image/bbox/label/mask/keypoint tensors inside dict-based `.pt` files, with configurable key-to-role mapping
