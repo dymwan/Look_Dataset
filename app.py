@@ -100,6 +100,7 @@ class PTLoadRequest(BaseModel):
     mask_key: str = ""
     keypoint_key: str = ""
     bbox_mode: str = "xyxy"  # xyxy | xywh
+    target_key: str = ""  # if set, look inside data[target_key] for annotations
 
 
 class COCOLoadRequest(BaseModel):
@@ -400,6 +401,27 @@ def _color_for_id(cat_id: int) -> str:
     return palette[cat_id % len(palette)]
 
 
+def _key_info(key, value) -> dict:
+    """Describe a single key from a PT dict."""
+    info = {"name": key, "type": type(value).__name__}
+    if isinstance(value, (torch.Tensor, np.ndarray)):
+        info["shape"] = list(value.shape)
+        info["dtype"] = str(value.dtype)
+        info["suggested_role"] = _suggest_role(key, tuple(value.shape), str(value.dtype))
+    elif isinstance(value, list):
+        info["len"] = len(value)
+        if value and isinstance(value[0], (torch.Tensor, np.ndarray)):
+            info["element_shape"] = list(value[0].shape)
+            info["element_dtype"] = str(value[0].dtype)
+        info["suggested_role"] = _suggest_role(key, (len(value),), "list")
+    elif isinstance(value, dict):
+        info["keys"] = list(value.keys())
+        info["suggested_role"] = "dict"
+    else:
+        info["suggested_role"] = "other"
+    return info
+
+
 # ============================================================================
 # API Routes
 # ============================================================================
@@ -421,6 +443,69 @@ async def check_path(path: str = Query("/")):
         "path": str(p),
         "error": None,
         "is_dir": is_dir,
+    })
+
+
+@app.get("/api/pt/list")
+async def pt_list(path: str = Query(...)):
+    """List .pt files quickly via glob (no full directory scan), and detect keys from first file.
+
+    Respects the 'target' convention: if the dict has a 'target' key (a sub-dict),
+    all selectable annotation keys come from inside it. Otherwise non-image top-level keys.
+    """
+    if not HAS_TORCH:
+        raise HTTPException(500, "torch is not installed")
+
+    p = Path(path)
+    if not p.exists() or not p.is_dir():
+        raise HTTPException(404, f"Directory not found: {path}")
+
+    # Fast glob for .pt/.pth only — avoids stat-ing every file in the directory
+    pt_paths = list(p.glob("*.pt")) + list(p.glob("*.pth"))
+    # Deduplicate in case a file matches both patterns
+    seen = set()
+    unique = []
+    for x in pt_paths:
+        if x.name not in seen:
+            seen.add(x.name)
+            unique.append(x)
+    pt_paths = unique
+    pt_files = [{"name": x.name, "path": str(x)} for x in pt_paths]
+
+    target_keys = []
+    top_keys = []
+    has_target = False
+    image_key = ""
+
+    if pt_files:
+        try:
+            data = torch.load(pt_paths[0], map_location="cpu", weights_only=False)
+            if isinstance(data, dict):
+                target_data = data.get("target")
+                if isinstance(target_data, dict):
+                    has_target = True
+                    for key, value in target_data.items():
+                        info = _key_info(key, value)
+                        target_keys.append(info)
+                        if info.get("suggested_role") == "image":
+                            image_key = key
+                else:
+                    for key, value in data.items():
+                        info = _key_info(key, value)
+                        top_keys.append(info)
+                        if info.get("suggested_role") == "image":
+                            image_key = key
+        except Exception as e:
+            print(f"[pt/list] Failed to read first file: {e}")
+
+    return JSONResponse({
+        "path": path,
+        "files": pt_files,
+        "total": len(pt_files),
+        "has_target": has_target,
+        "image_key": image_key,
+        "target_keys": target_keys,
+        "top_keys": top_keys,
     })
 
 
@@ -554,22 +639,31 @@ async def pt_load(req: PTLoadRequest):
                     print(f"  key={k!r}  type={t}  value={str(v)[:200]}")
 
         try:
+            # Determine lookup source: inside data["target"] or data itself
+            lookup = data.get(req.target_key) if req.target_key else data
+
             # Extract image (use user-specified key, or auto-detect)
             cur_image_key = image_key
-            if cur_image_key not in data:
-                for k, v in data.items():
-                    if isinstance(v, (torch.Tensor, np.ndarray)) and v.ndim == 3:
-                        if v.shape[0] in (1, 3, 4) or v.shape[-1] in (1, 3, 4):
-                            cur_image_key = k
-                            break
-                # Auto-find image key
-                for k, v in data.items():
-                    if isinstance(v, (torch.Tensor, np.ndarray)) and v.ndim == 3:
-                        if v.shape[0] in (1, 3, 4) or v.shape[-1] in (1, 3, 4):
-                            image_key = k
-                            break
+            if cur_image_key not in data and (not req.target_key or cur_image_key not in (data.get(req.target_key) or {})):
+                # Search in data first, then inside target if set
+                search_in = [data]
+                if req.target_key and isinstance(data.get(req.target_key), dict):
+                    search_in.append(data[req.target_key])
+                for src in search_in:
+                    for k, v in src.items():
+                        if isinstance(v, (torch.Tensor, np.ndarray)) and v.ndim == 3:
+                            if v.shape[0] in (1, 3, 4) or v.shape[-1] in (1, 3, 4):
+                                cur_image_key = k
+                                break
+                    if cur_image_key in src:
+                        break
 
-            image_tensor = data.get(cur_image_key) if cur_image_key else None
+            # Retrieve image: check data first, then target_data
+            image_tensor = data.get(cur_image_key)
+            if image_tensor is None and req.target_key:
+                td = data.get(req.target_key)
+                if isinstance(td, dict):
+                    image_tensor = td.get(cur_image_key)
             if image_tensor is None:
                 continue
 
@@ -582,18 +676,18 @@ async def pt_load(req: PTLoadRequest):
             img = tensor_to_pil(image_tensor)
             width, height = img.size
 
-            # Extract annotations
+            # Extract annotations from lookup (respects target_key)
             annotations = []
 
             # BBox
-            bbox_tensor = data.get(req.bbox_key) if req.bbox_key else None
-            label_tensor = data.get(req.label_key) if req.label_key else None
+            bbox_tensor = lookup.get(req.bbox_key) if req.bbox_key else None
+            label_tensor = lookup.get(req.label_key) if req.label_key else None
             if bbox_tensor is not None:
                 bbox_anns = _convert_bbox(bbox_tensor, req.bbox_mode, label_tensor)
                 annotations.extend(bbox_anns)
 
             # Masks
-            mask_tensor = data.get(req.mask_key) if req.mask_key else None
+            mask_tensor = lookup.get(req.mask_key) if req.mask_key else None
             if mask_tensor is not None:
                 mask_anns = _convert_mask(mask_tensor)
                 for ma in mask_anns:
@@ -604,7 +698,7 @@ async def pt_load(req: PTLoadRequest):
                         annotations.append({"polygons": ma["polygons"]})
 
             # Keypoints
-            kpt_tensor = data.get(req.keypoint_key) if req.keypoint_key else None
+            kpt_tensor = lookup.get(req.keypoint_key) if req.keypoint_key else None
             if kpt_tensor is not None and annotations:
                 kpts = _convert_keypoint(kpt_tensor)
                 for i, ann in enumerate(annotations):

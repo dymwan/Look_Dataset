@@ -215,8 +215,55 @@ button:disabled { opacity: 0.3; cursor: default; }
   padding: 3px 0;
   font-size: 0.8rem;
   cursor: pointer;
+  flex-shrink: 0;
 }
 .toggle input { accent-color: var(--accent2); }
+
+/* Layer rows (checkbox + dropdown) */
+.layer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+}
+.layer-select {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.7rem;
+}
+.layer-select:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.layer-select option {
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* BBox mode row */
+.bbox-mode-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.bbox-mode-row select { flex: 1; }
+
+/* Layer action buttons */
+.layer-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.layer-actions button {
+  flex: 1;
+  font-size: 0.75rem;
+  padding: 4px 8px;
+}
 
 /* Hint */
 .hint { font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; }

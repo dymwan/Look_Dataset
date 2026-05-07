@@ -35,21 +35,6 @@
       </div>
     </section>
 
-    <section class="panel" id="keymap-panel" style="display:none;">
-      <h3>键位映射 <span class="hint" id="detect-status"></span></h3>
-      <div id="keymap-loading" style="display:none;">检测中...</div>
-      <div id="keymap-content">
-        <div class="keymap-grid" id="keymap-grid"></div>
-        <div class="bbox-mode" id="bbox-mode-row" style="display:none;">
-          <label>BBox 格式:</label>
-          <select id="bbox-mode">
-            <option value="xyxy">xyxy (左上+右下)</option>
-            <option value="xywh">xywh (左上+宽高)</option>
-          </select>
-        </div>
-      </div>
-    </section>
-
     <section class="panel">
       <h3>随机抽样</h3>
       <div class="sample-row">
@@ -61,10 +46,31 @@
 
     <section class="panel">
       <h3>图层显示</h3>
-      <label class="toggle"><input type="checkbox" id="show-bbox" checked> BBox 框</label>
-      <label class="toggle"><input type="checkbox" id="show-polygon" checked> 矢量掩码</label>
+      <div class="layer-row">
+        <label class="toggle"><input type="checkbox" id="show-bbox" checked> BBox 框</label>
+        <select id="select-bbox-key" class="layer-select" disabled>
+          <option value="">-- 先抽样 --</option>
+        </select>
+      </div>
+      <div class="layer-row">
+        <label class="toggle"><input type="checkbox" id="show-polygon" checked> 矢量掩码</label>
+        <select id="select-mask-key" class="layer-select" disabled>
+          <option value="">-- 先抽样 --</option>
+        </select>
+      </div>
       <label class="toggle"><input type="checkbox" id="show-keypoint" checked> 关键点</label>
       <label class="toggle"><input type="checkbox" id="show-label" checked> 类别标签</label>
+      <div class="layer-actions">
+        <button id="btn-lock" disabled>固定</button>
+        <button id="btn-reselect" disabled>重选</button>
+      </div>
+      <div class="bbox-mode-row" style="margin-top:6px;">
+        <label style="font-size:0.78rem;color:var(--text-dim);">BBox 格式:</label>
+        <select id="bbox-mode">
+          <option value="xyxy">xyxy (左上+右下)</option>
+          <option value="xywh">xywh (左上+宽高)</option>
+        </select>
+      </div>
     </section>
   </aside>
 
@@ -110,8 +116,6 @@
   var state = {
     datasetType: "pt",
     currentPath: "",
-    keys: [],
-    keyMapping: {},
     bboxMode: "xyxy",
     samples: [],
     currentIndex: 0,
@@ -121,6 +125,12 @@
     dragStart: { x: 0, y: 0 },
     layerVis: { bbox: true, polygon: true, keypoint: true, label: true },
     hoveredAnnIdx: -1,
+    // New: key selection via dropdowns
+    ptFiles: [],           // list of .pt file names in current dir
+    targetKey: "",         // "target" if target dict exists, else ""
+    imageKey: "",          // auto-detected image key name
+    availableKeys: [],     // keys for dropdowns (from target or top-level)
+    locked: false,         // true after "固定"
   };
 
   // ---- El cache ----
@@ -128,10 +138,10 @@
   function cacheEls() {
     var ids = [
       "path-input","btn-browse","path-status",
-      "keymap-panel","keymap-loading","keymap-content","keymap-grid",
-      "bbox-mode-row","bbox-mode","detect-status",
       "btn-random","sample-count","sample-status",
-      "show-bbox","show-polygon","show-keypoint","show-label",
+      "show-bbox","select-bbox-key","show-polygon","select-mask-key",
+      "show-keypoint","show-label",
+      "btn-lock","btn-reselect",
       "canvas-container","image-wrapper","main-image","overlay-canvas",
       "no-data-msg","info-bar","info-filename","info-dims","info-annots",
       "nav-bar","btn-prev","btn-next","nav-index","thumbnail-strip",
@@ -139,7 +149,7 @@
     ids.forEach(function(id) { E[id] = qs("#" + id); });
     E.datasetTabs = qsa("#dataset-type-tabs .tab");
   }
-  cacheEls();  // call immediately so E.* is available below
+  cacheEls();
 
   // ---- API helpers ----
   function apiGet(url) {
@@ -162,10 +172,16 @@
   // ---- Dataset type toggle ----
   function updateUIType() {
     var isPT = state.datasetType === "pt";
-    E["keymap-panel"].style.display = isPT ? "" : "none";
-    if (E["bbox-mode-row"]) E["bbox-mode-row"].style.display = "none";
-    state.keys = [];
+    // Layer dropdowns only for PT; COCO uses fixed format
+    E["select-bbox-key"].style.display = isPT ? "" : "none";
+    E["select-mask-key"].style.display = isPT ? "" : "none";
+    E["btn-lock"].style.display = isPT ? "" : "none";
+    E["btn-reselect"].style.display = isPT ? "" : "none";
+    state.ptFiles = [];
+    state.availableKeys = [];
+    state.locked = false;
     state.samples = [];
+    resetDropdowns();
     resetView();
   }
 
@@ -199,132 +215,179 @@
     });
   }
 
-  // ---- PT Key detection (unused, kept for reference) ----
-  function detectKeys(filePath) {
-    var dir = filePath.substring(0, filePath.lastIndexOf("/"));
-    var file = filePath.substring(filePath.lastIndexOf("/") + 1);
-    E["keymap-loading"].style.display = "";
-    E["keymap-content"].style.display = "none";
-    E["detect-status"].textContent = "";
-    apiPost("/api/pt/detect", { path: dir, file: file }).then(function(data) {
-      state.keys = data.keys;
-      state.currentPath = dir;
-      renderKeyMapping(data.keys);
-      E["keymap-loading"].style.display = "none";
-      E["keymap-content"].style.display = "";
-      E["detect-status"].textContent = "已检测: " + file;
-    }).catch(function(e) {
-      E["keymap-loading"].style.display = "none";
-      E["detect-status"].textContent = "检测失败: " + e.message;
-    });
-  }
+  // =========================================================================
+  // Random Sample (new flow: glob list → detect keys → populate dropdowns → load)
+  // =========================================================================
 
-  function detectKeysSilent(filePath) {
-    var dir = filePath.substring(0, filePath.lastIndexOf("/"));
-    var file = filePath.substring(filePath.lastIndexOf("/") + 1);
-    return apiPost("/api/pt/detect", { path: dir, file: file }).then(function(data) {
-      state.keys = data.keys;
-      var am = {};
-      data.keys.forEach(function(k) {
-        if (k.suggested_role === "image" && !am.image) am.image = k.name;
-        if ((k.suggested_role === "bbox" || k.suggested_role === "bbox_label") && !am.bbox) am.bbox = k.name;
-        if (k.suggested_role === "label" && !am.label) am.label = k.name;
-        if (k.suggested_role === "mask" && !am.mask) am.mask = k.name;
-        if (k.suggested_role === "keypoint" && !am.keypoint) am.keypoint = k.name;
-      });
-      state.keyMapping = am;
-    });
-  }
-
-  var ROLES = [
-    { value: "", label: "-- 忽略 --" },
-    { value: "image", label: "图像" },
-    { value: "bbox", label: "BBox" },
-    { value: "bbox_label", label: "BBox+类别" },
-    { value: "label", label: "类别标签" },
-    { value: "mask", label: "掩码" },
-    { value: "keypoint", label: "关键点" },
-  ];
-
-  function renderKeyMapping(keys) {
-    var am = {};
-    keys.forEach(function(k) {
-      if (k.suggested_role === "image" && !am.image) am.image = k.name;
-      if ((k.suggested_role === "bbox" || k.suggested_role === "bbox_label") && !am.bbox) am.bbox = k.name;
-      if (k.suggested_role === "label" && !am.label) am.label = k.name;
-      if (k.suggested_role === "mask" && !am.mask) am.mask = k.name;
-      if (k.suggested_role === "keypoint" && !am.keypoint) am.keypoint = k.name;
-    });
-    state.keyMapping = am;
-
-    var html = '<div class="keymap-row header"><span class="name">键名</span><span class="shape">形状/类型</span><span>角色</span></div>';
-    keys.forEach(function(k) {
-      var shapeStr = k.shape ? k.shape.join(" × ") : (k.len !== undefined ? "list[" + k.len + "]" : k.type);
-      if (k.dtype) shapeStr += " (" + k.dtype + ")";
-      if (k.element_shape) shapeStr += " of " + k.element_shape.join("×");
-      var cur = "";
-      for (var r in am) { if (am[r] === k.name) { cur = r; break; } }
-      var opts = ROLES.map(function(r) {
-        return '<option value="' + r.value + '"' + (r.value === cur ? " selected" : "") + '>' + r.label + '</option>';
-      }).join("");
-      html += '<div class="keymap-row"><span class="name" title="' + k.name + '">' + k.name + '</span><span class="shape">' + shapeStr + '</span><select data-key="' + k.name + '">' + opts + '</select></div>';
-    });
-    E["keymap-grid"].innerHTML = html;
-    E["bbox-mode-row"].style.display = (am.bbox || am.label) ? "flex" : "none";
-    qsa("#keymap-grid select").forEach(function(sel) {
-      sel.addEventListener("change", function() {
-        var kn = sel.dataset.key;
-        var role = sel.value;
-        for (var r in state.keyMapping) { if (state.keyMapping[r] === kn) delete state.keyMapping[r]; }
-        if (role && role !== "bbox_label") state.keyMapping[role] = kn;
-        else if (role === "bbox_label") state.keyMapping.bbox = kn;
-        E["bbox-mode-row"].style.display = state.keyMapping.bbox ? "flex" : "none";
-      });
-    });
-  }
-
-  // ---- Random Sample ----
   E["btn-random"].addEventListener("click", function() { randomSample(); });
 
   function randomSample() {
     var path = state.currentPath || E["path-input"].value.trim();
     if (!path) { E["sample-status"].textContent = "请先输入数据路径"; return; }
     state.currentPath = path;
+
+    if (state.datasetType === "coco") {
+      randomSampleCOCO(path);
+      return;
+    }
+
+    // --- PT flow ---
     E["btn-random"].disabled = true;
     E["btn-random"].textContent = "加载中...";
     E["sample-status"].textContent = "";
 
-    if (state.datasetType === "pt") {
-      apiGet("/api/browse?path=" + encodeURIComponent(path)).then(function(data) {
-        if (data.error) { E["sample-status"].textContent = data.error; resetBtn(); return; }
-        var files = data.pt_files.map(function(f) { return f.name; });
-        if (files.length === 0) { E["sample-status"].textContent = "没有找到 .pt 文件"; resetBtn(); return; }
-        var count = Math.min(parseInt(E["sample-count"].value) || 10, files.length);
-        var selected = shuffleSlice(files, count);
-        var p = state.keys.length === 0
-          ? detectKeysSilent(path + "/" + files[0]).catch(function() {})
-          : Promise.resolve();
-        p.then(function() { return loadSamples(selected); })
-         .then(function() { E["sample-status"].textContent = "已加载 " + state.samples.length + " / " + files.length + " 个文件"; })
-         .catch(function(e) { E["sample-status"].textContent = "错误: " + e.message; })
-         .finally(resetBtn);
-      }).catch(function(e) { E["sample-status"].textContent = "错误: " + e.message; resetBtn(); });
-    } else {
-      Promise.resolve().then(function() {
-        return apiPost("/api/coco/info", { path: path }).catch(function() {
-          E["sample-status"].textContent = "未找到 COCO JSON 文件，尝试直接加载...";
-        });
-      }).then(function() {
-        var count = parseInt(E["sample-count"].value) || 10;
-        return apiPost("/api/coco/load", { path: path, count: count });
-      }).then(function(data) {
-        state.samples = data.samples;
-        state.currentIndex = 0;
-        renderSamples();
-      }).catch(function(e) { E["sample-status"].textContent = "错误: " + e.message; })
-        .finally(resetBtn);
+    // Reset lock state
+    state.locked = false;
+    state.availableKeys = [];
+    setDropdownsEnabled(true);
+    E["btn-lock"].disabled = false;
+    E["btn-reselect"].disabled = false;
+
+    // Step 1: Fast glob for .pt files + detect keys from first file
+    apiGet("/api/pt/list?path=" + encodeURIComponent(path)).then(function(data) {
+      if (data.total === 0) {
+        E["sample-status"].textContent = "没有找到 .pt 文件";
+        resetBtn(); return;
+      }
+
+      state.ptFiles = data.files.map(function(f) { return f.name; });
+      state.targetKey = data.has_target ? "target" : "";
+      state.imageKey = data.image_key;
+
+      var keys = data.has_target ? data.target_keys : data.top_keys;
+      state.availableKeys = keys;
+
+      // Step 2: Populate dropdowns with available keys
+      populateKeyDropdowns(keys);
+
+      // Step 3: Auto-select best keys and load
+      autoSelectKeys(keys);
+      loadWithKeys().finally(resetBtn);
+    }).catch(function(e) {
+      E["sample-status"].textContent = "错误: " + e.message;
+      resetBtn();
+    });
+  }
+
+  function randomSampleCOCO(path) {
+    E["btn-random"].disabled = true;
+    E["btn-random"].textContent = "加载中...";
+    E["sample-status"].textContent = "";
+    apiPost("/api/coco/info", { path: path }).catch(function() {
+      E["sample-status"].textContent = "未找到 COCO JSON 文件，尝试直接加载...";
+    }).then(function() {
+      var count = parseInt(E["sample-count"].value) || 10;
+      return apiPost("/api/coco/load", { path: path, count: count });
+    }).then(function(data) {
+      state.samples = data.samples;
+      state.currentIndex = 0;
+      renderSamples();
+    }).catch(function(e) {
+      E["sample-status"].textContent = "错误: " + e.message;
+    }).finally(resetBtn);
+  }
+
+  function resetDropdowns() {
+    var empty = '<option value="">-- 先抽样 --</option>';
+    E["select-bbox-key"].innerHTML = empty;
+    E["select-bbox-key"].disabled = true;
+    E["select-mask-key"].innerHTML = empty;
+    E["select-mask-key"].disabled = true;
+    E["btn-lock"].disabled = true;
+    E["btn-reselect"].disabled = true;
+  }
+
+  function populateKeyDropdowns(keys) {
+    var opts = keys.map(function(k) {
+      var label = k.name;
+      if (k.shape) label += " [" + k.shape.join("×") + "]";
+      if (k.dtype) label += " " + k.dtype;
+      return '<option value="' + k.name + '">' + label + '</option>';
+    }).join("");
+
+    E["select-bbox-key"].innerHTML = opts;
+    E["select-mask-key"].innerHTML = opts;
+    setDropdownsEnabled(true);
+  }
+
+  function autoSelectKeys(keys) {
+    var bboxKey = "";
+    var maskKey = "";
+    for (var i = 0; i < keys.length; i++) {
+      var role = keys[i].suggested_role;
+      if (!bboxKey && (role === "bbox" || role === "bbox_label")) bboxKey = keys[i].name;
+      if (!maskKey && role === "mask") maskKey = keys[i].name;
+    }
+    E["select-bbox-key"].value = bboxKey;
+    E["select-mask-key"].value = maskKey;
+  }
+
+  function loadWithKeys() {
+    if (state.ptFiles.length === 0) return;
+    var count = Math.min(parseInt(E["sample-count"].value) || 10, state.ptFiles.length);
+    var selected = shuffleSlice(state.ptFiles, count);
+
+    var bboxKey = E["select-bbox-key"].value;
+    var maskKey = E["select-mask-key"].value;
+
+    E["sample-status"].textContent = "加载中...";
+    return apiPost("/api/pt/load", {
+      path: state.currentPath,
+      files: selected,
+      image_key: state.imageKey,
+      bbox_key: bboxKey,
+      mask_key: maskKey,
+      label_key: "",
+      keypoint_key: "",
+      bbox_mode: state.bboxMode,
+      target_key: state.targetKey,
+    }).then(function(data) {
+      state.samples = data.samples.filter(function(s) { return s.image_url; });
+      state.currentIndex = 0;
+      renderSamples();
+      E["sample-status"].textContent = "已加载 " + state.samples.length + " / " + state.ptFiles.length + " 个文件";
+    }).catch(function(e) {
+      E["sample-status"].textContent = "错误: " + e.message;
+    });
+  }
+
+  function setDropdownsEnabled(enabled) {
+    if (enabled && state.locked) return;
+    E["select-bbox-key"].disabled = !enabled;
+    E["select-mask-key"].disabled = !enabled;
+    if (!enabled) {
+      E["btn-lock"].disabled = true;
     }
   }
+
+  // ---- Dropdown change → reload ----
+  E["select-bbox-key"].addEventListener("change", function() {
+    if (state.locked) return;
+    loadWithKeys().finally(resetBtn);
+  });
+  E["select-mask-key"].addEventListener("change", function() {
+    if (state.locked) return;
+    loadWithKeys().finally(resetBtn);
+  });
+
+  // ---- Lock / Reselect buttons ----
+  E["btn-lock"].addEventListener("click", function() {
+    state.locked = true;
+    setDropdownsEnabled(false);
+    E["btn-lock"].disabled = true;
+    E["sample-status"].textContent = "已固定";
+  });
+
+  E["btn-reselect"].addEventListener("click", function() {
+    resetDropdowns();
+    state.ptFiles = [];
+    state.availableKeys = [];
+    state.locked = false;
+    state.samples = [];
+    resetView();
+    E["sample-status"].textContent = "";
+    randomSample();
+  });
 
   function resetBtn() {
     E["btn-random"].disabled = false;
@@ -338,30 +401,6 @@
       var t = a[i]; a[i] = a[j]; a[j] = t;
     }
     return a.slice(0, n);
-  }
-
-  function loadSamples(files) {
-    if (!state.currentPath || files.length === 0) return Promise.resolve();
-    var km = {};
-    for (var r in state.keyMapping) km[r] = state.keyMapping[r];
-    if (!km.image) {
-      state.keys.forEach(function(k) { if (k.suggested_role === "image" && !km.image) km.image = k.name; });
-    }
-    E["sample-status"].textContent = "加载中...";
-    return apiPost("/api/pt/load", {
-      path: state.currentPath,
-      files: files,
-      image_key: km.image || "",
-      bbox_key: km.bbox || "",
-      label_key: km.label || "",
-      mask_key: km.mask || "",
-      keypoint_key: km.keypoint || "",
-      bbox_mode: state.bboxMode,
-    }).then(function(data) {
-      state.samples = data.samples.filter(function(s) { return s.image_url; });
-      state.currentIndex = 0;
-      renderSamples();
-    });
   }
 
   // ---- Render ----
@@ -597,12 +636,16 @@
   });
 
   // ---- BBox mode ----
-  E["bbox-mode"].addEventListener("change", function() { state.bboxMode = E["bbox-mode"].value; });
+  var bboxModeEl = qs("#bbox-mode");
+  if (bboxModeEl) bboxModeEl.addEventListener("change", function() { state.bboxMode = bboxModeEl.value; });
 
   // ---- Resize ----
   window.addEventListener("resize", function() {
     if (state.samples.length > 0) { sizeCanvasToImage(); drawOverlay(); }
   });
+
+  // Initialize: dropdowns start empty
+  resetDropdowns();
 
   console.log("[LookLabeledData] JS initialized OK, " + Object.keys(E).length + " DOM elements cached");
 })();
